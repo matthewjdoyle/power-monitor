@@ -1,0 +1,30 @@
+[Unit]
+Description=Power Monitor Collector (RAPL energy logging)
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/power-monitor-collector
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=power-monitor
+
+# Must run as root for RAPL sysfs access
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/power-monitor
+ReadOnlyPaths=/sys/class/powercap
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
