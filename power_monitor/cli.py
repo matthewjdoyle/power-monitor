@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-power-monitor — CLI for querying the RAPL energy monitoring database.
+power-monitor — CLI for querying the energy monitoring database.
 
 Usage:
   power-monitor status          Show current power draw
@@ -10,18 +10,16 @@ Usage:
   power-monitor export          Dump last 7 days as CSV
   power-monitor daily-log       Append yesterday's summary to daily CSV
   power-monitor graph [view]    Generate power graph (today|yesterday|week|range A B)
+  power-monitor probe           List available energy backends/domains
 """
-__version__ = "1.0.0"
+from power_monitor import __version__
 
 import argparse
 import csv
-import os
-import socket
 import sqlite3
 import sys
 import time
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
 # ── Agg backend before importing pyplot (headless server) ─────────────────
 import matplotlib
@@ -29,19 +27,22 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import numpy as np
 
-# ── Paths ─────────────────────────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("POWER_MONITOR_DATA_DIR",
-                                os.path.expanduser("~/.local/share/power-monitor")))
-DB_PATH = Path(os.environ.get("POWER_MONITOR_DB", str(DATA_DIR / "power.db")))
-PLOTS_DIR = DATA_DIR / "plots"
-DAILY_CSV = Path(os.environ.get("POWER_MONITOR_CSV", str(DATA_DIR / "daily_summary.csv")))
+from power_monitor.config import (
+    COST_PER_KWH,
+    CSV_PATH,
+    DB_PATH,
+    HOSTNAME,
+    PLOTS_DIR,
+    SAMPLE_INTERVAL,
+)
+from power_monitor.schema import primary_label, primary_power, primary_sql_expr
+from power_monitor.collector import cmd_probe as run_probe
 
-# ── Constants ─────────────────────────────────────────────────────────────
-COST_PER_KWH = float(os.environ.get("POWER_MONITOR_COST_PER_KWH", "0.34"))
-SAMPLE_INTERVAL = int(os.environ.get("POWER_MONITOR_SAMPLE_INTERVAL", "10"))
-HOSTNAME = os.environ.get("POWER_MONITOR_HOSTNAME", socket.gethostname())
+DAILY_CSV = CSV_PATH
 
 # Seaborn deep muted palette — clean modern look (blues, greens, warm accents)
 SEABORN_DEEP = [
@@ -106,6 +107,15 @@ def parse_date_range(start_str, end_str=None):
     return start.timestamp(), end.timestamp(), label
 
 
+def _coalesce_primary(package_w: np.ndarray, psys_w: np.ndarray) -> tuple[np.ndarray, bool]:
+    """Return (primary_w, has_psys) where primary is PSYS when available else package."""
+    has_psys = not np.all(np.isnan(psys_w))
+    if has_psys:
+        primary = np.where(np.isnan(psys_w), package_w, psys_w)
+        return primary, True
+    return package_w.copy(), False
+
+
 def daily_summary(ts_start, ts_end):
     """Return a dict with aggregated stats for the time window.
 
@@ -136,6 +146,7 @@ def daily_summary(ts_start, ts_end):
         [r["psys_w"] if r["psys_w"] is not None else np.nan for r in rows],
         dtype=float,
     )
+    primary_w, has_psys = _coalesce_primary(package_w, psys_w)
 
     dts = np.diff(timestamps)  # seconds between consecutive samples
 
@@ -153,20 +164,15 @@ def daily_summary(ts_start, ts_end):
     energy_kwh_pkg = energy_j_pkg / 3_600_000
     energy_j_psys = _trapz(psys_w)
     energy_kwh_psys = energy_j_psys / 3_600_000
-
-    # PSYS is the primary metric when available, else package
-    psys_available = not np.all(np.isnan(psys_w))
-    if psys_available and energy_kwh_psys > 0:
-        energy_kwh = energy_kwh_psys
-    else:
-        energy_kwh = energy_kwh_pkg
+    energy_j_primary = _trapz(primary_w)
+    energy_kwh = energy_j_primary / 3_600_000
     cost = energy_kwh * COST_PER_KWH
 
-    # Summary stats on package_w for backward compat of the text summary
-    pkg_valid = package_w[~np.isnan(package_w)]
-    avg_w = float(np.nanmean(package_w)) if len(pkg_valid) > 0 else 0.0
-    max_w = float(np.nanmax(package_w)) if len(pkg_valid) > 0 else 0.0
-    min_w = float(np.nanmin(package_w)) if len(pkg_valid) > 0 else 0.0
+    # Summary stats on the primary metric (PSYS or package)
+    valid = primary_w[~np.isnan(primary_w)]
+    avg_w = float(np.nanmean(primary_w)) if len(valid) > 0 else 0.0
+    max_w = float(np.nanmax(primary_w)) if len(valid) > 0 else 0.0
+    min_w = float(np.nanmin(primary_w)) if len(valid) > 0 else 0.0
 
     duration_s = timestamps[-1] - timestamps[0]
     duration_h = duration_s / 3600
@@ -183,12 +189,16 @@ def daily_summary(ts_start, ts_end):
         "energy_kwh_pkg": energy_kwh_pkg,
         "energy_kwh_psys": energy_kwh_psys,
         "cost_gbp": cost,
+        "primary_label": primary_label(has_psys),
+        "has_psys": has_psys,
     }
 
 
 def print_summary(s, label):
     """Pretty-print a daily_summary dict."""
+    metric = s.get("primary_label", "package")
     print(f"Power summary: {label}")
+    print(f"  Metric:      {metric}")
     print(f"  Samples:     {s['samples']}")
     print(f"  Duration:    {s['duration_h']:.1f} hours")
     print(f"  Average:     {s['avg_w']:6.2f}W")
@@ -256,10 +266,13 @@ def cmd_status():
     print(f"  DRAM:     {fmt_w(row['dram_w'])}")
     if row["psys_w"] is not None:
         print(f"  PSYS:     {fmt_w(row['psys_w'])}")
-    total = row["psys_w"] if row["psys_w"] is not None else (row["package_w"] or 0)
-    total_label = "PSYS (platform)" if row["psys_w"] is not None else "package"
+    total = primary_power(row)
+    total_label = primary_label(row["psys_w"] is not None)
     print(f"  ─────────────────")
-    print(f"  Total:    {total:6.2f}W  ({total_label})")
+    if total is not None:
+        print(f"  Total:    {total:6.2f}W  ({total_label})")
+    else:
+        print(f"  Total:       N/A  ({total_label})")
 
 
 def cmd_today():
@@ -537,6 +550,8 @@ def cmd_graph(view="today", start_str=None, end_str=None):
         bin_s = 86400  # 1 day max
 
     ts_ds, pkg_ds, psys_ds = _downsample(ts, pkg, psys, period_s=bin_s)
+    primary_ds, has_psys = _coalesce_primary(pkg_ds, psys_ds)
+    primary_name = "PSYS" if has_psys else "Package"
 
     _apply_style()
 
@@ -549,19 +564,21 @@ def cmd_graph(view="today", start_str=None, end_str=None):
 
     dt = [datetime.fromtimestamp(t, tz=timezone.utc) for t in ts_ds]
 
-    # Top panel: power lines
-    # Two-tier PSYS: raw faint, rolling mean bold
-    ax_top.plot(dt, psys_ds, color=SEABORN_DEEP[0], lw=0.4, alpha=0.25, label="_nolegend_")  # raw faint
-    ax_top.plot(dt, pkg_ds, color=SEABORN_DEEP[1], lw=0.5, alpha=0.4, label="Package")  # secondary, thin
+    # Top panel: power lines — primary bold, package secondary when PSYS exists
+    ax_top.plot(dt, primary_ds, color=SEABORN_DEEP[0], lw=0.4, alpha=0.25, label="_nolegend_")
+    if has_psys:
+        ax_top.plot(dt, pkg_ds, color=SEABORN_DEEP[1], lw=0.5, alpha=0.4, label="Package")
 
-    # PSYS rolling mean — the primary visible line
     window = max(5, int(900 / bin_s))
-    if len(psys_ds) > window:
-        roll = _rolling_mean(psys_ds, window)
+    if len(primary_ds) > window:
+        roll = _rolling_mean(primary_ds, window)
         roll_label_mins = bin_s * window // 60
-        ax_top.plot(dt, roll, color=SEABORN_DEEP[0], lw=1.8, label=f"PSYS rolling avg ({roll_label_mins}min)")
+        ax_top.plot(
+            dt, roll, color=SEABORN_DEEP[0], lw=1.8,
+            label=f"{primary_name} rolling avg ({roll_label_mins}min)",
+        )
     else:
-        ax_top.plot(dt, psys_ds, color=SEABORN_DEEP[0], lw=1.2, label="PSYS")
+        ax_top.plot(dt, primary_ds, color=SEABORN_DEEP[0], lw=1.2, label=primary_name)
 
     ax_top.set_ylabel("Power (W)")
     ax_top.set_title(title, loc="left", fontweight="bold")
@@ -569,9 +586,9 @@ def cmd_graph(view="today", start_str=None, end_str=None):
     ax_top.set_ylim(bottom=0)
 
     # Clip y-axis to p99 to prevent single spikes from squashing everything
-    psys_finite = psys_ds[np.isfinite(psys_ds)] if psys_ds is not None else np.array([])
+    primary_finite = primary_ds[np.isfinite(primary_ds)] if primary_ds is not None else np.array([])
     pkg_finite = pkg_ds[np.isfinite(pkg_ds)] if pkg_ds is not None else np.array([])
-    all_vals = np.concatenate([psys_finite, pkg_finite])
+    all_vals = np.concatenate([primary_finite, pkg_finite]) if has_psys else primary_finite
     all_vals = all_vals[all_vals > 0]  # exclude zeros
     if len(all_vals) > 10:
         clip_max = np.percentile(all_vals, 99)
@@ -581,9 +598,9 @@ def cmd_graph(view="today", start_str=None, end_str=None):
         else:
             ax_top.set_ylim(top=actual_max * 1.1)
 
-    # Bottom panel: cumulative energy (using PSYS if available, else package)
-    energy_source = psys_ds
-    energy_label = "PSYS"
+    # Bottom panel: cumulative energy from primary metric
+    energy_source = primary_ds
+    energy_wh = np.array([0.0])
     if len(ts_ds) > 1:
         dt_s = np.diff(ts_ds)
         energy_j = np.cumsum(np.nan_to_num(energy_source[:-1], nan=0) * dt_s)
@@ -599,7 +616,7 @@ def cmd_graph(view="today", start_str=None, end_str=None):
         else:
             elabel = f"{final_kwh:.2f} kWh"
         ax_bot.annotate(
-            f"{elabel} (PSYS)\nEst. cost: £{cost:.2f}",
+            f"{elabel} ({primary_name})\nEst. cost: £{cost:.2f}",
             xy=(dt[-1], final), xytext=(10, 5),
             textcoords="offset points", fontsize=9, ha="left", va="bottom",
             color=SEABORN_DEEP[0],
@@ -651,17 +668,18 @@ def cmd_graph(view="today", start_str=None, end_str=None):
 
 
 def cmd_graph_heatmap(days=7):
-    """Hour-of-day x day heatmap of average PSYS power."""
+    """Hour-of-day x day heatmap of average primary power (PSYS or package)."""
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     start = today_start - timedelta(days=days - 1)
+    primary = primary_sql_expr()
 
     conn = get_conn()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT
             date(datetime(timestamp, 'unixepoch')) as day,
             CAST(strftime('%H', datetime(timestamp, 'unixepoch')) AS INTEGER) as hour,
-            AVG(psys_w) as avg_psys
+            AVG({primary}) as avg_primary
         FROM power_samples
         WHERE timestamp >= ? AND timestamp < ?
         GROUP BY day, hour
@@ -684,12 +702,11 @@ def cmd_graph_heatmap(days=7):
         day_dt = datetime.strptime(day_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         day_idx = (day_dt - start).days
         if 0 <= day_idx < days:
-            grid[day_idx, r["hour"]] = r["avg_psys"]
+            grid[day_idx, r["hour"]] = r["avg_primary"]
 
     _apply_style()
     fig, ax = plt.subplots(figsize=(14, max(4, days * 0.35)))
 
-    # Seaborn-style heatmap colormap
     im = ax.imshow(grid, aspect="auto", cmap=HEATMAP_CMAP,
                    interpolation="nearest", vmin=0)
 
@@ -699,12 +716,11 @@ def cmd_graph_heatmap(days=7):
     ax.set_yticklabels(day_labels, fontsize=9)
 
     ax.set_xlabel("Hour of Day (UTC)")
-    ax.set_title(f"PSYS Power Heatmap — Last {days} Days", loc="left", fontweight="bold")
+    ax.set_title(f"Power Heatmap — Last {days} Days", loc="left", fontweight="bold")
 
     cbar = fig.colorbar(im, ax=ax, pad=0.02)
     cbar.set_label("Average Power (W)", fontsize=10)
 
-    # Annotate cells with values (only if grid is small enough)
     if days <= 14:
         for i in range(days):
             for j in range(24):
@@ -720,7 +736,7 @@ def cmd_graph_heatmap(days=7):
     plt.close(fig)
 
     print(f"Saved: {out_path}")
-    print(f"  {days}-day heatmap of average PSYS power")
+    print(f"  {days}-day heatmap of average power (PSYS or package)")
 
 
 def cmd_graph_month():
@@ -728,14 +744,15 @@ def cmd_graph_month():
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     start = today_start - timedelta(days=29)
+    primary = primary_sql_expr()
 
     conn = get_conn()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT
             date(datetime(timestamp, 'unixepoch')) as day,
-            AVG(psys_w) as avg_psys,
-            MAX(psys_w) as max_psys,
-            MIN(psys_w) as min_psys,
+            AVG({primary}) as avg_primary,
+            MAX({primary}) as max_primary,
+            MIN({primary}) as min_primary,
             COUNT(*) as samples
         FROM power_samples
         WHERE timestamp >= ? AND timestamp < ?
@@ -743,11 +760,11 @@ def cmd_graph_month():
         ORDER BY day
     """, (start.timestamp(), (today_start + timedelta(days=1)).timestamp())).fetchall()
 
-    heat_rows = conn.execute("""
+    heat_rows = conn.execute(f"""
         SELECT
             date(datetime(timestamp, 'unixepoch')) as day,
             CAST(strftime('%H', datetime(timestamp, 'unixepoch')) AS INTEGER) as hour,
-            AVG(psys_w) as avg_psys
+            AVG({primary}) as avg_primary
         FROM power_samples
         WHERE timestamp >= ? AND timestamp < ?
         GROUP BY day, hour
@@ -767,7 +784,7 @@ def cmd_graph_month():
         if d_str in day_map:
             r = day_map[d_str]
             hours_collected = r["samples"] * SAMPLE_INTERVAL / 3600
-            bar_energies.append((r["avg_psys"] or 0) * hours_collected / 1000)
+            bar_energies.append((r["avg_primary"] or 0) * hours_collected / 1000)
         else:
             bar_energies.append(0)
 
@@ -777,13 +794,12 @@ def cmd_graph_month():
         gridspec_kw={"height_ratios": [2, 1], "hspace": 0.25},
     )
 
-    # Top: heatmap
     grid = np.full((days, 24), np.nan)
     for r in heat_rows:
         day_dt = datetime.strptime(r["day"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
         day_idx = (day_dt - start).days
         if 0 <= day_idx < days:
-            grid[day_idx, r["hour"]] = r["avg_psys"]
+            grid[day_idx, r["hour"]] = r["avg_primary"]
 
     im = ax_top.imshow(grid, aspect="auto", cmap=HEATMAP_CMAP, interpolation="nearest", vmin=0)
     ax_top.set_xticks(range(24))
@@ -792,10 +808,9 @@ def cmd_graph_month():
     ax_top.set_yticklabels([day_labels[i] for i in range(0, days, 2)], fontsize=8)
     ax_top.set_xlabel("Hour of Day (UTC)")
     ax_top.set_ylabel("Day")
-    ax_top.set_title("Hourly PSYS Power (W)", loc="left", fontweight="bold")
+    ax_top.set_title("Hourly Power (W)", loc="left", fontweight="bold")
     fig.colorbar(im, ax=ax_top, pad=0.02, label="Avg Power (W)")
 
-    # Bottom: daily energy bars + 7-day rolling mean
     x = np.arange(days)
     bars = ax_bot.bar(x, bar_energies, color=SEABORN_DEEP[0], edgecolor="none", width=0.7)
     bars[-1].set_color(SEABORN_DEEP[6])
@@ -835,17 +850,15 @@ def cmd_graph_week():
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = today_start - timedelta(days=6)  # 7 days including today
+    primary = primary_sql_expr()
 
-    # Single SQL query grouped by date — much faster than 7 individual queries
     conn = get_conn()
     sql_rows = conn.execute(
-        """
+        f"""
         SELECT
             date(datetime(timestamp, 'unixepoch')) as day,
-            AVG(psys_w) as avg_psys,
+            AVG({primary}) as avg_primary,
             AVG(package_w) as avg_pkg,
-            MAX(psys_w) as max_psys,
-            MIN(psys_w) as min_psys,
             COUNT(*) as samples
         FROM power_samples
         WHERE timestamp >= ? AND timestamp < ?
@@ -856,7 +869,6 @@ def cmd_graph_week():
     ).fetchall()
     conn.close()
 
-    # Build a dict keyed by date string for quick lookup
     by_day = {}
     for r in sql_rows:
         by_day[r["day"]] = dict(r)
@@ -866,7 +878,7 @@ def cmd_graph_week():
     energies = []
     avg_powers = []
 
-    for i in range(6, -1, -1):  # 7 days ago → today
+    for i in range(6, -1, -1):
         day_start = today_start - timedelta(days=i)
         day_str = day_start.strftime("%Y-%m-%d")
         days.append(day_start)
@@ -876,15 +888,10 @@ def cmd_graph_week():
         if d and d["samples"] > 0:
             samples = d["samples"]
             hours_collected = samples * SAMPLE_INTERVAL / 3600
-            avg_psys = d["avg_psys"] if d["avg_psys"] is not None else d["avg_pkg"]
-            avg_pkg = d["avg_pkg"] if d["avg_pkg"] is not None else 0
-            # Use PSYS energy if available, else package
-            if avg_psys is not None and avg_psys > 0:
-                energy_kwh = avg_psys * hours_collected / 1000
-            else:
-                energy_kwh = avg_pkg * hours_collected / 1000
+            avg_primary = d["avg_primary"] if d["avg_primary"] is not None else (d["avg_pkg"] or 0)
+            energy_kwh = (avg_primary or 0) * hours_collected / 1000
             energies.append(energy_kwh)
-            avg_powers.append(avg_psys if avg_psys is not None else avg_pkg)
+            avg_powers.append(avg_primary if avg_primary is not None else 0)
         else:
             energies.append(0)
             avg_powers.append(0)
@@ -896,12 +903,11 @@ def cmd_graph_week():
     x = np.arange(len(days))
     bars = ax.bar(x, energies, color=SEABORN_DEEP[0], edgecolor="white", lw=0.5, width=0.65)
 
-    # Add value labels on bars  (last bar = today, show partial-day projection)
     y_max_data = max(energies) if energies else 0.001
     for i, (bar, e) in enumerate(zip(bars, energies)):
         if e > 0:
             label_text = f"{e:.3f}"
-            if i == len(bars) - 1:  # today (partial)
+            if i == len(bars) - 1:
                 d_str = days[i].strftime("%Y-%m-%d")
                 if d_str in by_day:
                     hours_collected = by_day[d_str]["samples"] * SAMPLE_INTERVAL / 3600
@@ -912,7 +918,6 @@ def cmd_graph_week():
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + y_max_data * 0.02,
                     label_text, ha="center", va="bottom", fontsize=9, fontweight="bold")
 
-    # Overlay average power as a line on secondary axis
     ax2 = ax.twinx()
     ax2.plot(x, avg_powers, color=SEABORN_DEEP[1], marker="o", ms=6, lw=2.0, label="Avg power (W)")
     ax2.set_ylabel("Average Power (W)", color=SEABORN_DEEP[1])
@@ -923,14 +928,10 @@ def cmd_graph_week():
     ax.set_xticklabels(labels, fontsize=9)
     ax.set_ylabel("Energy (kWh)")
     ax.set_title(f"Weekly Energy Consumption — {HOSTNAME}", loc="left", fontweight="bold")
-    ax.set_ylim(0, max(energies) * 1.20)
+    ax.set_ylim(0, max(energies) * 1.20 if max(energies) > 0 else 1)
 
-    # Highlight today's bar
-    bars[-1].set_color(SEABORN_DEEP[6])  # muted pink for today (incomplete)
+    bars[-1].set_color(SEABORN_DEEP[6])
 
-    # Legend
-    from matplotlib.patches import Patch
-    from matplotlib.lines import Line2D
     legend_elements = [
         Patch(facecolor=SEABORN_DEEP[0], label="Energy (kWh)"),
         Patch(facecolor=SEABORN_DEEP[6], label="Today (partial)"),
@@ -938,7 +939,6 @@ def cmd_graph_week():
     ]
     ax.legend(handles=legend_elements, loc="upper left")
 
-    # Add total annotation
     total_kwh = sum(energies)
     total_cost = total_kwh * COST_PER_KWH
     ax.text(0.99, 0.95, f"7-day total: {total_kwh:.3f} kWh\nEst. cost: £{total_cost:.2f}",
@@ -958,13 +958,21 @@ def cmd_graph_week():
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
 
+def cmd_probe():
+    """List available energy backends and domains."""
+    sys.exit(run_probe())
+
+
 def main():
     """Parse arguments and dispatch to the appropriate command."""
-    parser = argparse.ArgumentParser(description="RAPL power monitoring CLI")
+    parser = argparse.ArgumentParser(
+        description=f"Power monitoring CLI (v{__version__})"
+    )
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("status", help="Show current power draw")
     sub.add_parser("today", help="Show today's energy summary")
+    sub.add_parser("probe", help="List available energy backends/domains")
 
     r = sub.add_parser("range", help="Summary for date range")
     r.add_argument("start", help="Start date (YYYY-MM-DD)")
@@ -988,6 +996,8 @@ def main():
         cmd_status()
     elif args.cmd == "today":
         cmd_today()
+    elif args.cmd == "probe":
+        cmd_probe()
     elif args.cmd == "range":
         cmd_range(args.start, args.end)
     elif args.cmd == "watch":

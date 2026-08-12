@@ -1,42 +1,46 @@
 #!/usr/bin/env python3
 """
-power-monitor-collector -- RAPL energy monitoring daemon.
+power-monitor-collector — cross-platform energy monitoring daemon.
 
-Reads Intel RAPL energy counters from /sys/class/powercap/intel-rapl/ every
-INTERVAL seconds, computes instantaneous power (delta_energy / delta_time),
-and logs to a SQLite database.
+Auto-selects a measurement backend:
+  Windows: Energy Meter Interface (EMI)
+  Linux:   powercap RAPL (Intel + modern AMD), then amd_energy hwmon
 
-Must run as root -- RAPL sysfs files are readable only by root.
-Runs as a foreground process; managed by systemd.
+Samples every INTERVAL seconds, computes instantaneous power (delta_energy /
+delta_time), and logs to SQLite.
 
 Configuration via environment variables:
-  POWER_MONITOR_DATA_DIR     Data directory (default: ~/.local/share/power-monitor)
-  POWER_MONITOR_DB           SQLite database path (default: <data_dir>/power.db)
+  POWER_MONITOR_DATA_DIR         Data directory
+  POWER_MONITOR_DB               SQLite database path
   POWER_MONITOR_SAMPLE_INTERVAL  Seconds between samples (default: 10)
 """
 
+from __future__ import annotations
+
+import argparse
 import os
+import signal
+import sqlite3
 import sys
 import time
-import signal
-import socket
-import sqlite3
 from pathlib import Path
-from datetime import datetime, timezone
 
-# -- Config ----------------------------------------------------------------
-INTERVAL = int(os.environ.get("POWER_MONITOR_SAMPLE_INTERVAL", "10"))
-DATA_DIR = Path(os.environ.get("POWER_MONITOR_DATA_DIR",
-                               os.path.expanduser("~/.local/share/power-monitor")))
-DB_PATH = Path(os.environ.get("POWER_MONITOR_DB", str(DATA_DIR / "power.db")))
-RAPL_BASE = Path("/sys/class/powercap")
+from power_monitor.backends import energy_delta, probe_backends, select_backend
+from power_monitor.config import DATA_DIR, DB_PATH, SAMPLE_INTERVAL
+from power_monitor.schema import DOMAIN_TO_COLUMN, POWER_COLUMNS, init_db
+
+if sys.platform.startswith("win"):
+    import ctypes
+else:
+    ctypes = None  # type: ignore
+
+INTERVAL = SAMPLE_INTERVAL
 
 # We'll keep the DB owned by the regular user so the CLI (running as user)
-# can read it.
+# can read it (Linux only).
 DB_UID = None
 DB_GID = None
 
-# Graceful shutdown
 running = True
 
 
@@ -45,72 +49,20 @@ def handle_signal(signum, frame):
     running = False
 
 
-signal.signal(signal.SIGTERM, handle_signal)
-signal.signal(signal.SIGINT, handle_signal)
-
-
-# -- RAPL discovery --------------------------------------------------------
-
-def discover_rapl_domains() -> list[tuple[str, Path]]:
-    """
-    Scan /sys/class/powercap/intel-rapl*/ for energy_uj files.
-    Returns a list of (name, energy_uj_path) tuples.
-    """
-    domains = []
-    for rapl_dir in sorted(RAPL_BASE.glob("intel-rapl:*")):
-        energy_file = rapl_dir / "energy_uj"
-        if energy_file.exists():
-            name_file = rapl_dir / "name"
-            if name_file.exists():
-                name = name_file.read_text().strip()
-            else:
-                name = rapl_dir.name
-            domains.append((name, energy_file))
-
-        for sub_dir in sorted(rapl_dir.glob("intel-rapl:*:*")):
-            energy_file = sub_dir / "energy_uj"
-            name_file = sub_dir / "name"
-            if energy_file.exists() and name_file.exists():
-                name = name_file.read_text().strip()
-                domains.append((name, energy_file))
-
-    return domains
-
-
-def read_energy(domain_path: Path) -> float:
-    """Read energy_uj and return joules (float)."""
-    raw = domain_path.read_text().strip()
-    microjoules = int(raw)
-    return microjoules / 1_000_000.0
-
-
-# -- Database --------------------------------------------------------------
-
-def init_db() -> sqlite3.Connection:
-    """Create database and tables if they don't exist."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS power_samples (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            package_w REAL,
-            cores_w   REAL,
-            uncore_w  REAL,
-            dram_w    REAL,
-            psys_w    REAL
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON power_samples(timestamp)")
-    conn.commit()
-    return conn
+def _is_elevated() -> bool:
+    if sys.platform.startswith("win"):
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
 def resolve_db_owner():
     """Figure out the UID/GID of the home directory so we can chown the DB."""
     global DB_UID, DB_GID
+    if sys.platform.startswith("win") or not hasattr(os, "chown"):
+        return
     home_dir = os.path.expanduser("~")
     try:
         st = os.stat(home_dir)
@@ -120,87 +72,159 @@ def resolve_db_owner():
         pass
 
 
-def ensure_db_owned():
-    """Make sure the DB file is owned by the regular user, not root."""
-    if DB_UID is not None and DB_PATH.exists():
+def ensure_db_owned(db_path: Path):
+    """Make sure the DB file is owned by the regular user, not root (Linux)."""
+    if DB_UID is None or not hasattr(os, "chown"):
+        return
+    if db_path.exists():
         try:
-            os.chown(DB_PATH, DB_UID, DB_GID)
+            os.chown(db_path, DB_UID, DB_GID)
         except OSError:
             pass
 
 
-# -- Main loop -------------------------------------------------------------
+def cmd_probe() -> int:
+    """Print discovered backends/domains and exit."""
+    print(f"Platform: {sys.platform}")
+    print(f"Data dir: {DATA_DIR}")
+    print(f"DB path:  {DB_PATH}")
+    print()
+    results = probe_backends()
+    if not results:
+        print("No backends available on this platform.")
+        return 1
 
-def main():
+    any_ok = False
+    for entry in results:
+        print(f"Backend: {entry['backend']}")
+        print(f"  requires_elevated: {entry.get('requires_elevated')}")
+        if entry.get("error"):
+            print(f"  error: {entry['error']}")
+        raw = entry.get("raw_channels")
+        if raw is not None:
+            if not raw:
+                print("  raw EMI channels: (none)")
+            else:
+                print("  raw EMI channels:")
+                for ch in raw:
+                    key = ch.get("key") or "(unmapped)"
+                    print(f"    [{ch['channel']}] {ch['name']!r} -> {key}")
+        domains = entry.get("domains") or []
+        if domains:
+            any_ok = True
+            print("  selected domains:")
+            for d in domains:
+                print(f"    {d['key']:8s}  {d['name']}")
+        else:
+            print("  selected domains: (none)")
+        print()
+
+    if not any_ok:
+        print("ERROR: No usable energy domains found.")
+        if sys.platform.startswith("win"):
+            print(
+                "EMI is typically available on Windows 11 bare metal. "
+                "VMs and some OEM systems may not expose energy meters."
+            )
+        else:
+            print(
+                "On Linux, ensure RAPL is exposed at /sys/class/powercap/intel-rapl/ "
+                "(works for Intel and modern AMD) or that the amd_energy hwmon driver is loaded."
+            )
+        return 1
+
+    print("OK: at least one backend discovered usable domains.")
+    return 0
+
+
+def run_collector(db_path: Path, interval: int) -> int:
     global running
 
-    resolve_db_owner()
+    backend = select_backend()
+    if backend is None:
+        print(
+            "ERROR: No energy measurement backend available. "
+            "Run with --probe for details.",
+            file=sys.stderr,
+        )
+        return 1
 
-    domains = discover_rapl_domains()
+    if backend.requires_elevated() and not _is_elevated():
+        print(
+            f"ERROR: backend '{backend.name}' requires elevated privileges "
+            f"(root/Administrator).",
+            file=sys.stderr,
+        )
+        return 1
+
+    domains = backend.discover()
     if not domains:
-        print("ERROR: No RAPL domains found. Exiting.", file=sys.stderr)
-        sys.exit(1)
+        print("ERROR: Backend discovered no domains.", file=sys.stderr)
+        return 1
 
-    domain_map = {name: path for name, path in domains}
-    print(f"Discovered RAPL domains: {list(domain_map.keys())}", file=sys.stderr)
+    # Need a package domain to insert rows (schema requires package for skip logic)
+    if not any(d.key == "package" for d in domains):
+        print(
+            "ERROR: No package/socket energy domain found. "
+            f"Discovered: {[d.name for d in domains]}",
+            file=sys.stderr,
+        )
+        return 1
 
-    conn = init_db()
-    ensure_db_owned()
+    resolve_db_owner()
+    print(
+        f"Using backend={backend.name}; domains="
+        f"{[(d.key, d.name) for d in domains]}",
+        file=sys.stderr,
+    )
 
-    prev_energy = {}
+    conn = init_db(db_path)
+    ensure_db_owned(db_path)
+
+    prev_energy: dict[str, float | None] = {}
     prev_time = time.time()
-    for name, path in domains:
+    for domain in domains:
         try:
-            prev_energy[name] = read_energy(path)
+            prev_energy[domain.name] = domain.read_joules()
         except (OSError, ValueError) as e:
-            print(f"WARN: cannot read {name} ({path}): {e}", file=sys.stderr)
-            prev_energy[name] = None
+            print(f"WARN: cannot read {domain.name}: {e}", file=sys.stderr)
+            prev_energy[domain.name] = None
 
-    print(f"Collector running. interval={INTERVAL}s, db={DB_PATH}", file=sys.stderr)
+    print(f"Collector running. interval={interval}s, db={db_path}", file=sys.stderr)
 
     while running:
-        time.sleep(INTERVAL)
+        time.sleep(interval)
         if not running:
             break
 
         now = time.time()
         dt = now - prev_time
+        row: dict = {"timestamp": now}
 
-        row = {"timestamp": now}
-
-        for name, path in domains:
+        for domain in domains:
             try:
-                energy_j = read_energy(path)
+                energy_j = domain.read_joules()
             except (OSError, ValueError):
                 continue
 
-            if prev_energy.get(name) is not None:
-                prev = prev_energy[name]
-                de = energy_j - prev if energy_j >= prev else energy_j
+            prev = prev_energy.get(domain.name)
+            if prev is not None:
+                de = energy_delta(prev, energy_j, domain.max_joules)
                 power_w = de / dt if dt > 0 else 0.0
             else:
                 power_w = None
 
-            prev_energy[name] = energy_j
-
-            col = name.replace("-", "_").replace(" ", "_")
-            if "package" in col:
-                row["package_w"] = power_w
-            elif "uncore" in col:
-                row["uncore_w"] = power_w
-            elif "core" in col:
-                row["cores_w"] = power_w
-            elif "dram" in col:
-                row["dram_w"] = power_w
-            elif "psys" in col:
-                row["psys_w"] = power_w
+            prev_energy[domain.name] = energy_j
+            column = DOMAIN_TO_COLUMN.get(domain.key)
+            if column:
+                row[column] = power_w
 
         prev_time = now
 
         if "package_w" not in row:
             continue
 
-        for col in ("package_w", "cores_w", "uncore_w", "dram_w", "psys_w"):
+        for col in POWER_COLUMNS:
             row.setdefault(col, None)
 
         try:
@@ -208,22 +232,70 @@ def main():
                 """INSERT INTO power_samples
                    (timestamp, package_w, cores_w, uncore_w, dram_w, psys_w)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (row["timestamp"], row["package_w"], row["cores_w"],
-                 row["uncore_w"], row["dram_w"], row["psys_w"])
+                (
+                    row["timestamp"],
+                    row["package_w"],
+                    row["cores_w"],
+                    row["uncore_w"],
+                    row["dram_w"],
+                    row["psys_w"],
+                ),
             )
             conn.commit()
         except sqlite3.Error as e:
             print(f"DB error: {e}", file=sys.stderr)
 
-        ensure_db_owned()
+        ensure_db_owned(db_path)
 
     conn.close()
     print("Collector stopped.", file=sys.stderr)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Power monitor collector — sample CPU energy counters to SQLite"
+    )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="List available backends/domains and exit",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=INTERVAL,
+        help=f"Sample interval in seconds (default: {INTERVAL})",
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=DB_PATH,
+        help=f"SQLite database path (default: {DB_PATH})",
+    )
+    parser.add_argument(
+        "--logfile",
+        type=Path,
+        default=None,
+        help="Append collector stderr/stdout to this file (for headless/pythonw runs)",
+    )
+    args = parser.parse_args(argv)
+
+    if args.logfile is not None:
+        args.logfile.parent.mkdir(parents=True, exist_ok=True)
+        log_fp = open(args.logfile, "a", encoding="utf-8", buffering=1)
+        sys.stdout = log_fp
+        sys.stderr = log_fp
+
+    if args.probe:
+        sys.exit(cmd_probe())
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    sys.exit(run_collector(args.db, args.interval))
 
 
 if __name__ == "__main__":
-    if os.geteuid() != 0:
-        print("ERROR: power-monitor-collector must run as root (needs RAPL sysfs access).",
-              file=sys.stderr)
-        sys.exit(1)
     main()
