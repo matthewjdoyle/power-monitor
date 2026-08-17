@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="power-monitor",
-    version="1.0.0",
-    description="Intel RAPL energy monitoring with SQLite logging and matplotlib graphs",
+    version="1.1.0",
+    description="Cross-platform CPU energy monitoring (Linux RAPL + Windows EMI) with SQLite logging and matplotlib graphs",
     author="Matthew Doyle",
     license="MIT",
     packages=find_packages(),

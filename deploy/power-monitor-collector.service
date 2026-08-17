@@ -1,5 +1,5 @@
 [Unit]
-Description=Power Monitor Collector (RAPL energy logging)
+Description=Power Monitor Collector (CPU energy logging)
 After=multi-user.target
 Wants=multi-user.target
 
@@ -12,13 +12,18 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=power-monitor
 
-# Must run as root for RAPL sysfs access
+# Shared data dir so root collector and user CLI use the same database
+Environment=POWER_MONITOR_DATA_DIR=/var/lib/power-monitor
+# Optional: set your tariff
+# Environment=POWER_MONITOR_COST_PER_KWH=0.27
+
+# Must run as root for RAPL/powercap sysfs access on Linux
 User=root
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/power-monitor
-ReadOnlyPaths=/sys/class/powercap
+ReadWritePaths=/var/lib/power-monitor
+ReadOnlyPaths=/sys/class/powercap /sys/class/hwmon
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
