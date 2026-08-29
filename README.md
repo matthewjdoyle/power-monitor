@@ -190,9 +190,10 @@ power-monitor graph [view]    Generate a PNG graph
 
 #### Time-series (today, yesterday, range, all)
 
-Two-panel figure:
-- **Top panel:** Power (W) over time. Primary metric (PSYS if present, else package) as a bold rolling average with a faint raw line. When PSYS is primary, package is shown as a thin secondary trace.
-- **Bottom panel:** Cumulative energy (Wh) integrated from the primary metric, with total and estimated cost.
+Dashboard figure (wide power panel on top; square energy panel and analytics table below):
+- **Power panel:** Power (W) over time. Primary metric (PSYS if present, else package) as a bold rolling average with a faint raw line. When PSYS is primary, package is shown as a thin secondary trace. The y-axis clips raw spikes to p99 but always keeps the rolling average fully on-scale.
+- **Energy panel (square):** Cumulative energy (Wh) integrated from the primary metric, annotated with the total.
+- **Analytics table:** booktabs/LaTeX-paper style (serif, horizontal rules only) with duration, sample counts, average/median/95th-percentile/peak/idle power, energy used, window cost, projected costs per hour/day/week/month/year assuming 24/7 operation at the average load, and a duty-cycle-adjusted annual estimate that splits the year into estimated uptime (>5 W, at active mean power), idle (sampled but ≤5 W, at idle mean power), and off (no samples — asleep/powered down, at 0 W) hours.
 
 #### Weekly / monthly / heatmap
 

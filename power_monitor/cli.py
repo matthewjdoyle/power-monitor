@@ -21,6 +21,12 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ── Agg backend before importing pyplot (headless server) ─────────────────
 import matplotlib
 matplotlib.use("Agg", force=True)
@@ -482,6 +488,81 @@ def _rolling_mean(arr, window):
     return result
 
 
+def _fmt_cost(gbp):
+    """Format a GBP cost compactly (pence for tiny values, £ otherwise)."""
+    if gbp < 0.01:
+        return f"{gbp * 100:.1f}p"
+    if gbp >= 1000:
+        return f"£{gbp:,.0f}"
+    return f"£{gbp:.2f}"
+
+
+def _format_time_axis(ax, span_h, compact=False):
+    """Apply adaptive time formatting to an axis given the span in hours.
+
+    compact=True halves the tick density for narrow panels.
+    """
+    step = 3 if compact else 1
+    if span_h <= 6:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=1 * step))
+        ax.xaxis.set_minor_locator(mdates.MinuteLocator(interval=30 * step))
+    elif span_h <= 24:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=2 * step))
+        ax.xaxis.set_minor_locator(mdates.HourLocator(interval=1 * step))
+    elif span_h <= 48:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=4 * step))
+    elif span_h <= 168:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%a %d"))
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=1 * step))
+        ax.xaxis.set_minor_locator(mdates.HourLocator(interval=6))
+    elif span_h <= 720:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=2 * step))
+    else:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1 * step))
+
+
+def _add_latex_table(ax, rows, header=("Metric", "Value")):
+    """Render a booktabs-style (LaTeX paper) two-column table.
+
+    rows: list of (label, value); a None value marks a bold section header
+    preceded by a \\midrule.  Rules only (toprule/midrule/bottomrule),
+    no verticals, no shading, serif font.  Text is placed manually so the
+    rules align exactly with row boundaries.
+    """
+    ax.axis("off")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    data = [(header[0], header[1], "header")] + [
+        (lab, "" if val is None else val, "section" if val is None else "row")
+        for lab, val in rows
+    ]
+    n = len(data)
+    h = 1.0 / n
+    for i, (lab, val, kind) in enumerate(data):
+        y = 1 - (i + 0.5) * h
+        bold = kind in ("header", "section")
+        ax.text(0.015, y, lab, ha="left", va="center", fontsize=9,
+                family="serif", fontweight="bold" if bold else "normal")
+        if kind != "section":
+            ax.text(0.985, y, val, ha="right", va="center", fontsize=9,
+                    family="serif", fontweight="bold" if kind == "header" else "normal")
+
+    def hline(y, lw):
+        ax.plot([0.0, 1.0], [y, y], color="black", lw=lw, clip_on=False, zorder=5)
+
+    hline(1.0, 1.3)      # \toprule
+    hline(1 - h, 0.6)    # \midrule under column header
+    hline(0.0, 1.3)      # \bottomrule
+    for i, (_, _, kind) in enumerate(data):
+        if kind == "section" and i > 1:
+            hline(1 - i * h, 0.6)  # \midrule above section header
+
+
 def cmd_graph(view="today", start_str=None, end_str=None):
     """Generate a power graph and save to PLOTS_DIR."""
     now = datetime.now(timezone.utc)
@@ -523,6 +604,7 @@ def cmd_graph(view="today", start_str=None, end_str=None):
         if ts is None or len(ts) == 0:
             print("No data in database.", file=sys.stderr)
             sys.exit(1)
+        ts_start, ts_end = float(ts[0]), float(ts[-1])
         start_ts = datetime.fromtimestamp(ts[0], tz=timezone.utc)
         end_ts = datetime.fromtimestamp(ts[-1], tz=timezone.utc)
         title = f"Power — All Data ({start_ts.strftime('%Y-%m-%d')} → {end_ts.strftime('%Y-%m-%d')})"
@@ -555,24 +637,43 @@ def cmd_graph(view="today", start_str=None, end_str=None):
 
     _apply_style()
 
-    # ── Figure ─────────────────────────────────────────────────────────
-    fig, (ax_top, ax_bot) = plt.subplots(
-        2, 1, figsize=(14, 6.5),
-        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
-        sharex=True,
-    )
+    # Rolling average computed up-front so the y-axis can guarantee it fits
+    window = max(5, int(900 / bin_s))
+    roll = None
+    roll_label_mins = 0
+    if len(primary_ds) > window:
+        roll = _rolling_mean(primary_ds, window)
+        roll_label_mins = bin_s * window // 60
 
     dt = [datetime.fromtimestamp(t, tz=timezone.utc) for t in ts_ds]
+    span_h = (ts_ds[-1] - ts_ds[0]) / 3600
 
-    # Top panel: power lines — primary bold, package secondary when PSYS exists
+    # ── Dashboard layout ─────────────────────────────────────────────
+    #   [ Power vs time ........................ ]
+    #   [ Energy (square) ][ LaTeX-style table .. ]
+    FIG_W, FIG_H = 14.0, 8.6
+    M_L, M_R = 0.055, 0.045
+    TOP_B, TOP_H = 0.585, 0.300
+    BOT_B, BOT_H = 0.085, 0.345
+    TAB_H = TOP_B - 0.095 - BOT_B  # table runs taller than the square energy panel
+    side = BOT_H * FIG_H / FIG_W  # width fraction that makes the energy panel square
+
+    fig = plt.figure(figsize=(FIG_W, FIG_H))
+    ax_top = fig.add_axes([M_L, TOP_B, 1 - M_L - M_R, TOP_H])
+    ax_bot = fig.add_axes([M_L, BOT_B, side, BOT_H])
+    ax_tab = fig.add_axes([M_L + side + 0.045, BOT_B,
+                           1 - M_L - M_R - side - 0.045, TAB_H])
+
+    for ax in (ax_top, ax_bot):
+        ax.grid(True, which="major", alpha=0.25, lw=0.6)
+        ax.set_axisbelow(True)
+
+    # ── Power panel ──────────────────────────────────────────────────
     ax_top.plot(dt, primary_ds, color=SEABORN_DEEP[0], lw=0.4, alpha=0.25, label="_nolegend_")
     if has_psys:
         ax_top.plot(dt, pkg_ds, color=SEABORN_DEEP[1], lw=0.5, alpha=0.4, label="Package")
 
-    window = max(5, int(900 / bin_s))
-    if len(primary_ds) > window:
-        roll = _rolling_mean(primary_ds, window)
-        roll_label_mins = bin_s * window // 60
+    if roll is not None:
         ax_top.plot(
             dt, roll, color=SEABORN_DEEP[0], lw=1.8,
             label=f"{primary_name} rolling avg ({roll_label_mins}min)",
@@ -581,11 +682,12 @@ def cmd_graph(view="today", start_str=None, end_str=None):
         ax_top.plot(dt, primary_ds, color=SEABORN_DEEP[0], lw=1.2, label=primary_name)
 
     ax_top.set_ylabel("Power (W)")
-    ax_top.set_title(title, loc="left", fontweight="bold")
     ax_top.legend(loc="upper right", ncol=2)
+    ax_top.set_xlim(dt[0], dt[-1])
     ax_top.set_ylim(bottom=0)
 
-    # Clip y-axis to p99 to prevent single spikes from squashing everything
+    # Clip y-axis to p99 to prevent single spikes from squashing everything,
+    # but never below the rolling average — the bold line must stay on-scale.
     primary_finite = primary_ds[np.isfinite(primary_ds)] if primary_ds is not None else np.array([])
     pkg_finite = pkg_ds[np.isfinite(pkg_ds)] if pkg_ds is not None else np.array([])
     all_vals = np.concatenate([primary_finite, pkg_finite]) if has_psys else primary_finite
@@ -593,62 +695,115 @@ def cmd_graph(view="today", start_str=None, end_str=None):
     if len(all_vals) > 10:
         clip_max = np.percentile(all_vals, 99)
         actual_max = np.max(all_vals)
-        if clip_max < actual_max * 0.9:
-            ax_top.set_ylim(top=clip_max * 1.1)
-        else:
-            ax_top.set_ylim(top=actual_max * 1.1)
+        top = clip_max if clip_max < actual_max * 0.9 else actual_max
+    elif len(all_vals) > 0:
+        top = float(np.max(all_vals))
+    else:
+        top = 1.0
+    if roll is not None and np.isfinite(roll).any():
+        top = max(top, float(np.nanmax(roll)))
+    ax_top.set_ylim(top=top * 1.1)
+    _format_time_axis(ax_top, span_h)
 
-    # Bottom panel: cumulative energy from primary metric
-    energy_source = primary_ds
+    # ── Energy panel (square) ────────────────────────────────────────
     energy_wh = np.array([0.0])
     if len(ts_ds) > 1:
         dt_s = np.diff(ts_ds)
-        energy_j = np.cumsum(np.nan_to_num(energy_source[:-1], nan=0) * dt_s)
-        energy_wh = energy_j / 3600
-        energy_wh = np.insert(energy_wh, 0, 0)
+        energy_j = np.cumsum(np.nan_to_num(primary_ds[:-1], nan=0) * dt_s)
+        energy_wh = np.insert(energy_j / 3600, 0, 0)
         ax_bot.fill_between(dt, energy_wh, color=SEABORN_DEEP[7], alpha=0.15)
         ax_bot.plot(dt, energy_wh, color=SEABORN_DEEP[7], lw=1.2)
         final = energy_wh[-1]
-        final_kwh = final / 1000
-        cost = final_kwh * COST_PER_KWH
-        if final < 1:
-            elabel = f"{final * 1000:.1f} Wh"
-        else:
-            elabel = f"{final_kwh:.2f} kWh"
+        elabel = f"{final * 1000:.1f} Wh" if final < 1 else f"{final / 1000:.2f} kWh"
         ax_bot.annotate(
-            f"{elabel} ({primary_name})\nEst. cost: £{cost:.2f}",
-            xy=(dt[-1], final), xytext=(10, 5),
-            textcoords="offset points", fontsize=9, ha="left", va="bottom",
-            color=SEABORN_DEEP[0],
+            f"{elabel} ({primary_name})",
+            xy=(0.03, 0.95), xycoords="axes fraction",
+            fontsize=9, ha="left", va="top", color=SEABORN_DEEP[0],
         )
 
     ax_bot.set_ylabel("Energy (Wh)")
     ax_bot.set_xlabel("Time")
-    ax_bot.yaxis.set_major_locator(mticker.MaxNLocator(nbins=6))
+    ax_bot.yaxis.set_major_locator(mticker.MaxNLocator(nbins=5))
+    ax_bot.set_xlim(dt[0], dt[-1])
+    ax_bot.set_ylim(bottom=0)
+    _format_time_axis(ax_bot, span_h, compact=True)
 
-    # Time axis formatting — adapt to time range
-    span_h = (ts_ds[-1] - ts_ds[0]) / 3600
-    if span_h <= 6:
-        ax_bot.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-        ax_bot.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-        ax_bot.xaxis.set_minor_locator(mdates.MinuteLocator(interval=30))
-    elif span_h <= 24:
-        ax_bot.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-        ax_bot.xaxis.set_major_locator(mdates.HourLocator(interval=2))
-        ax_bot.xaxis.set_minor_locator(mdates.HourLocator(interval=1))
-    elif span_h <= 48:
-        ax_bot.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-        ax_bot.xaxis.set_major_locator(mdates.HourLocator(interval=4))
-    elif span_h <= 168:
-        ax_bot.xaxis.set_major_formatter(mdates.DateFormatter("%a %d"))
-        ax_bot.xaxis.set_major_locator(mdates.DayLocator())
-        ax_bot.xaxis.set_minor_locator(mdates.HourLocator(interval=6))
-    elif span_h <= 720:
-        ax_bot.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-        ax_bot.xaxis.set_major_locator(mdates.DayLocator(interval=2))
-    else:
-        ax_bot.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-        ax_bot.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+    # ── Analytics table ──────────────────────────────────────────────
+    finite = primary_ds[np.isfinite(primary_ds)] if primary_ds is not None else np.array([])
+    avg_w = float(np.mean(finite)) if len(finite) else 0.0
+    med_w = float(np.median(finite)) if len(finite) else 0.0
+    p95_w = float(np.percentile(finite, 95)) if len(finite) else 0.0
+    max_w = float(np.max(finite)) if len(finite) else 0.0
+    min_w = float(np.min(finite)) if len(finite) else 0.0
+    final_kwh = float(energy_wh[-1]) / 1000
+    period_cost = final_kwh * COST_PER_KWH
+
+    def projected(hours):
+        return avg_w * hours / 1000 * COST_PER_KWH
+
+    # Uptime/downtime duty-cycle model: classify each time bin as up (>5 W),
+    # idle (sampled but <=5 W), or off (no samples — machine asleep/powered
+    # down).  Project a year of wall-clock time at those shares, costing up
+    # and idle bins at their own mean power and off time at 0 W.
+    HOURS_YEAR = 8760
+    total_s = max(ts_end - ts_start, bin_s)
+    finite_mask = np.isfinite(primary_ds)
+    up_mask = finite_mask & (primary_ds > 5)
+    idle_mask = finite_mask & (primary_ds <= 5)
+    up_frac = min(up_mask.sum() * bin_s / total_s, 1.0)
+    idle_frac = min(idle_mask.sum() * bin_s / total_s, max(1.0 - up_frac, 0.0))
+    off_frac = max(1.0 - up_frac - idle_frac, 0.0)
+    avg_active_w = float(np.mean(primary_ds[up_mask])) if up_mask.any() else 0.0
+    avg_idle_w = float(np.mean(primary_ds[idle_mask])) if idle_mask.any() else 0.0
+    up_h = HOURS_YEAR * up_frac
+    idle_h = HOURS_YEAR * idle_frac
+    down_h = HOURS_YEAR * (idle_frac + off_frac)
+    duty_annual_cost = (avg_active_w * up_h + avg_idle_w * idle_h) / 1000 * COST_PER_KWH
+
+    rows = [
+        ("Window analytics", None),
+        ("Duration", f"{span_h:.1f} h"),
+        ("Samples", f"{len(ts):,} raw / {len(ts_ds):,} binned"),
+        ("Average power", f"{avg_w:.1f} W"),
+        ("Median power", f"{med_w:.1f} W"),
+        ("95th percentile", f"{p95_w:.1f} W"),
+        ("Peak power", f"{max_w:.1f} W"),
+        ("Idle power (min)", f"{min_w:.1f} W"),
+        ("Energy used", f"{final_kwh:.3f} kWh"),
+        ("Cost (this window)", _fmt_cost(period_cost)),
+        (f"Projected cost @ {avg_w:.0f} W avg (24/7)", None),
+        ("Per hour", _fmt_cost(projected(1))),
+        ("Per day", _fmt_cost(projected(24))),
+        ("Per week", _fmt_cost(projected(168))),
+        ("Per month", _fmt_cost(projected(730))),
+        ("Per year", _fmt_cost(projected(HOURS_YEAR))),
+        ("Annual cost @ uptime/downtime", None),
+        ("Estimated uptime", f"{up_frac * 100:.0f}%  ({up_h:,.0f} h/yr)"),
+        ("Estimated downtime", f"{(idle_frac + off_frac) * 100:.0f}%  ({down_h:,.0f} h/yr)"),
+        ("  idle / off split", f"{idle_frac * 100:.0f}% / {off_frac * 100:.0f}%"),
+        ("Avg power when up", f"{avg_active_w:.1f} W"),
+        ("Avg power when idle", f"{avg_idle_w:.1f} W"),
+        ("Est. total cost / year", _fmt_cost(duty_annual_cost)),
+    ]
+    _add_latex_table(ax_tab, rows)
+    ax_tab.text(
+        0.0, -0.04,
+        f"Table 1: Power analytics and cost projections for {title.replace('— ', '')} "
+        f"(duty-cycle model: {up_frac * 100:.0f}% up @ {avg_active_w:.0f} W, "
+        f"{idle_frac * 100:.0f}% idle @ {avg_idle_w:.0f} W, "
+        f"{off_frac * 100:.0f}% off).",
+        transform=ax_tab.transAxes, fontsize=8.5, family="serif", style="italic",
+        ha="left", va="top", wrap=True,
+    )
+
+    # ── Dashboard header ─────────────────────────────────────────────
+    fig.text(M_L, 0.965, title, fontsize=15, fontweight="bold", ha="left")
+    fig.text(
+        M_L, 0.935,
+        f"{HOSTNAME} · primary metric: {primary_name} · tariff £{COST_PER_KWH:.2f}/kWh · "
+        f"{len(ts):,} raw → {len(ts_ds):,} binned ({bin_s}s)",
+        fontsize=9, color="#555555", ha="left",
+    )
     fig.autofmt_xdate(rotation=30, ha="right")
 
     # Save
@@ -665,6 +820,8 @@ def cmd_graph(view="today", start_str=None, end_str=None):
         print(f"  Data points: {len(ts)} raw → {len(ts_ds)} binned ({bin_s}s bins)")
         print(f"  Total energy: {total_wh:.2f} Wh  ({total_wh / 1000:.3f} kWh)")
         print(f"  Est. cost: £{total_wh / 1000 * COST_PER_KWH:.3f}")
+        print(f"  Projected: {_fmt_cost(projected(24))}/day · {_fmt_cost(projected(730))}/month · {_fmt_cost(projected(8760))}/year (at {avg_w:.1f} W avg)")
+        print(f"  Duty-cycle: {up_frac * 100:.0f}% up @ {avg_active_w:.1f} W, {idle_frac * 100:.0f}% idle @ {avg_idle_w:.1f} W, {off_frac * 100:.0f}% off → est. {_fmt_cost(duty_annual_cost)}/year")
 
 
 def cmd_graph_heatmap(days=7):
