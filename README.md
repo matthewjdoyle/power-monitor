@@ -179,7 +179,7 @@ power-monitor graph [view]    Generate a PNG graph
   Views:
     today       Today's power time-series (default)
     yesterday   Yesterday's power time-series
-    week        Bar chart of last 7 days daily energy
+    week        7-day dashboard: daily energy bars + cumulative energy + analytics table
     month       30-day heatmap + daily energy bar chart
     heatmap     Hour-of-day x day heatmap (last 7 days)
     all         All data in the database (adaptive downsampling)
@@ -195,7 +195,11 @@ Dashboard figure (wide power panel on top; square energy panel and analytics tab
 - **Energy panel (square):** Cumulative energy (Wh) integrated from the primary metric, annotated with the total.
 - **Analytics table:** booktabs/LaTeX-paper style (serif, horizontal rules only) with duration, sample counts, average/median/95th-percentile/peak/idle power, energy used, window cost, projected costs per hour/day/week/month/year assuming 24/7 operation at the average load, and a duty-cycle-adjusted annual estimate that splits the year into estimated uptime (>5 W, at active mean power), idle (sampled but ≤5 W, at idle mean power), and off (no samples — asleep/powered down, at 0 W) hours.
 
-#### Weekly / monthly / heatmap
+#### Weekly
+
+Same dashboard layout as the time-series views: daily energy bars with the per-day average-power line on top, a square cumulative-energy panel, and the booktabs analytics table (weekly stats, 24/7 projections, and the duty-cycle-adjusted annual cost).
+
+#### Monthly / heatmap
 
 Use the same primary metric (`COALESCE(psys_w, package_w)`), so AMD systems without PSYS still graph correctly.
 

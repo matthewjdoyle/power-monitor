@@ -1003,7 +1003,7 @@ def cmd_graph_month():
 
 
 def cmd_graph_week():
-    """Bar chart of daily energy for the last 7 days."""
+    """Dashboard of daily energy for the last 7 days with analytics table."""
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = today_start - timedelta(days=6)  # 7 days including today
@@ -1016,7 +1016,11 @@ def cmd_graph_week():
             date(datetime(timestamp, 'unixepoch')) as day,
             AVG({primary}) as avg_primary,
             AVG(package_w) as avg_pkg,
-            COUNT(*) as samples
+            COUNT(*) as samples,
+            SUM(CASE WHEN {primary} > 5 THEN 1 ELSE 0 END) as up_samples,
+            SUM(CASE WHEN {primary} <= 5 THEN 1 ELSE 0 END) as idle_samples,
+            AVG(CASE WHEN {primary} > 5 THEN {primary} END) as avg_up_w,
+            AVG(CASE WHEN {primary} <= 5 THEN {primary} END) as avg_idle_w
         FROM power_samples
         WHERE timestamp >= ? AND timestamp < ?
         GROUP BY date(datetime(timestamp, 'unixepoch'))
@@ -1053,10 +1057,56 @@ def cmd_graph_week():
             energies.append(0)
             avg_powers.append(0)
 
+    # Weekly aggregates for the analytics table + duty-cycle model
+    total_samples = sum(d["samples"] for d in by_day.values())
+    days_with_data = sum(1 for e in energies if e > 0)
+    total_kwh = sum(energies)
+    total_cost = total_kwh * COST_PER_KWH
+    avg_w = (
+        sum((d["avg_primary"] or d["avg_pkg"] or 0) * d["samples"] for d in by_day.values()) / total_samples
+        if total_samples else 0.0
+    )
+    up_samples = sum(d.get("up_samples") or 0 for d in by_day.values())
+    idle_samples = sum(d.get("idle_samples") or 0 for d in by_day.values())
+    up_w_num = sum((d.get("avg_up_w") or 0) * (d.get("up_samples") or 0) for d in by_day.values())
+    idle_w_num = sum((d.get("avg_idle_w") or 0) * (d.get("idle_samples") or 0) for d in by_day.values())
+    avg_active_w = up_w_num / up_samples if up_samples else 0.0
+    avg_idle_w = idle_w_num / idle_samples if idle_samples else 0.0
+
+    HOURS_YEAR = 8760
+    window_h = 7 * 24
+    up_frac = min(up_samples * SAMPLE_INTERVAL / 3600 / window_h, 1.0)
+    idle_frac = min(idle_samples * SAMPLE_INTERVAL / 3600 / window_h, max(1.0 - up_frac, 0.0))
+    off_frac = max(1.0 - up_frac - idle_frac, 0.0)
+    up_h = HOURS_YEAR * up_frac
+    idle_h = HOURS_YEAR * idle_frac
+    down_h = HOURS_YEAR * (idle_frac + off_frac)
+    duty_annual_cost = (avg_active_w * up_h + avg_idle_w * idle_h) / 1000 * COST_PER_KWH
+
+    def projected(hours):
+        return avg_w * hours / 1000 * COST_PER_KWH
+
     _apply_style()
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    # ── Dashboard layout (mirrors the time-series dashboard) ─────────
+    FIG_W, FIG_H = 14.0, 8.6
+    M_L, M_R = 0.055, 0.045
+    TOP_B, TOP_H = 0.565, 0.320
+    BOT_B, BOT_H = 0.085, 0.345
+    TAB_H = TOP_B - 0.095 - BOT_B
+    side = BOT_H * FIG_H / FIG_W  # square cumulative-energy panel
 
+    fig = plt.figure(figsize=(FIG_W, FIG_H))
+    ax = fig.add_axes([M_L, TOP_B, 1 - M_L - M_R, TOP_H])
+    ax_cum = fig.add_axes([M_L, BOT_B, side, BOT_H])
+    ax_tab = fig.add_axes([M_L + side + 0.045, BOT_B,
+                           1 - M_L - M_R - side - 0.045, TAB_H])
+
+    for a in (ax, ax_cum):
+        a.grid(True, which="major", alpha=0.25, lw=0.6)
+        a.set_axisbelow(True)
+
+    # ── Daily energy bars + average power line ───────────────────────
     x = np.arange(len(days))
     bars = ax.bar(x, energies, color=SEABORN_DEEP[0], edgecolor="white", lw=0.5, width=0.65)
 
@@ -1080,11 +1130,11 @@ def cmd_graph_week():
     ax2.set_ylabel("Average Power (W)", color=SEABORN_DEEP[1])
     ax2.tick_params(axis="y", colors=SEABORN_DEEP[1])
     ax2.set_ylim(bottom=0)
+    ax2.grid(False)
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=9)
     ax.set_ylabel("Energy (kWh)")
-    ax.set_title(f"Weekly Energy Consumption — {HOSTNAME}", loc="left", fontweight="bold")
     ax.set_ylim(0, max(energies) * 1.20 if max(energies) > 0 else 1)
 
     bars[-1].set_color(SEABORN_DEEP[6])
@@ -1094,13 +1144,71 @@ def cmd_graph_week():
         Patch(facecolor=SEABORN_DEEP[6], label="Today (partial)"),
         Line2D([0], [0], color=SEABORN_DEEP[1], marker="o", lw=2.0, label="Avg power (W)"),
     ]
-    ax.legend(handles=legend_elements, loc="upper left")
+    ax.legend(handles=legend_elements, loc="upper right", framealpha=0.9)
 
-    total_kwh = sum(energies)
-    total_cost = total_kwh * COST_PER_KWH
-    ax.text(0.99, 0.95, f"7-day total: {total_kwh:.3f} kWh\nEst. cost: £{total_cost:.2f}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.8))
+    # ── Cumulative energy panel (square) ─────────────────────────────
+    cum_dates = [days[0]] + [d + timedelta(days=1) for d in days]
+    cum_kwh = np.concatenate([[0.0], np.cumsum(energies)]) * 1000  # Wh
+    ax_cum.plot(cum_dates, cum_kwh, color=SEABORN_DEEP[7], lw=1.4)
+    ax_cum.fill_between(cum_dates, cum_kwh, color=SEABORN_DEEP[7], alpha=0.15)
+    ax_cum.set_ylabel("Energy (Wh)")
+    ax_cum.set_xlabel("Time")
+    ax_cum.set_xlim(cum_dates[0], cum_dates[-1])
+    ax_cum.set_ylim(bottom=0)
+    ax_cum.yaxis.set_major_locator(mticker.MaxNLocator(nbins=5))
+    ax_cum.xaxis.set_major_formatter(mdates.DateFormatter("%a"))
+    ax_cum.xaxis.set_major_locator(mdates.DayLocator())
+    ax_cum.annotate(
+        f"{total_kwh:.2f} kWh",
+        xy=(0.03, 0.95), xycoords="axes fraction",
+        fontsize=9, ha="left", va="top", color=SEABORN_DEEP[0],
+    )
+
+    # ── Analytics table (LaTeX style) ────────────────────────────────
+    peak_i = int(np.argmax(energies)) if energies else 0
+    busy_i = int(np.argmax(avg_powers)) if avg_powers else 0
+    rows = [
+        ("Weekly analytics", None),
+        ("Days with data", f"{days_with_data} of 7"),
+        ("Window", f"{window_h} h ({week_ago.strftime('%d %b')} → {today_start.strftime('%d %b')})"),
+        ("Samples", f"{total_samples:,}"),
+        ("Average power", f"{avg_w:.1f} W"),
+        ("Peak day", f"{days[peak_i].strftime('%a')} — {energies[peak_i]:.3f} kWh"),
+        ("Busiest day", f"{days[busy_i].strftime('%a')} — {avg_powers[busy_i]:.1f} W avg"),
+        ("Energy used", f"{total_kwh:.3f} kWh"),
+        ("Cost (7 days)", _fmt_cost(total_cost)),
+        (f"Projected cost @ {avg_w:.0f} W avg (24/7)", None),
+        ("Per day", _fmt_cost(projected(24))),
+        ("Per week", _fmt_cost(projected(168))),
+        ("Per month", _fmt_cost(projected(730))),
+        ("Per year", _fmt_cost(projected(HOURS_YEAR))),
+        ("Annual cost @ uptime/downtime", None),
+        ("Estimated uptime", f"{up_frac * 100:.0f}%  ({up_h:,.0f} h/yr)"),
+        ("Estimated downtime", f"{(idle_frac + off_frac) * 100:.0f}%  ({down_h:,.0f} h/yr)"),
+        ("  idle / off split", f"{idle_frac * 100:.0f}% / {off_frac * 100:.0f}%"),
+        ("Avg power when up", f"{avg_active_w:.1f} W"),
+        ("Avg power when idle", f"{avg_idle_w:.1f} W"),
+        ("Est. total cost / year", _fmt_cost(duty_annual_cost)),
+    ]
+    _add_latex_table(ax_tab, rows)
+    ax_tab.text(
+        0.0, -0.04,
+        f"Table 1: Weekly power analytics and cost projections for {HOSTNAME} "
+        f"(duty-cycle model: {up_frac * 100:.0f}% up @ {avg_active_w:.0f} W, "
+        f"{idle_frac * 100:.0f}% idle @ {avg_idle_w:.0f} W, "
+        f"{off_frac * 100:.0f}% off).",
+        transform=ax_tab.transAxes, fontsize=8.5, family="serif", style="italic",
+        ha="left", va="top", wrap=True,
+    )
+
+    # ── Dashboard header ─────────────────────────────────────────────
+    fig.text(M_L, 0.965, f"Weekly Energy Consumption — {week_ago.strftime('%d %b')} → {today_start.strftime('%d %b')}",
+             fontsize=15, fontweight="bold", ha="left")
+    fig.text(
+        M_L, 0.935,
+        f"{HOSTNAME} · tariff £{COST_PER_KWH:.2f}/kWh · {total_samples:,} samples over {days_with_data}/7 days",
+        fontsize=9, color="#555555", ha="left",
+    )
 
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = PLOTS_DIR / f"power_week_{today_start.strftime('%Y%m%d')}.png"
@@ -1109,6 +1217,8 @@ def cmd_graph_week():
 
     print(f"Saved: {out_path}")
     print(f"  7-day total: {total_kwh:.3f} kWh  (£{total_cost:.2f})")
+    print(f"  Projected: {_fmt_cost(projected(730))}/month · {_fmt_cost(projected(HOURS_YEAR))}/year (at {avg_w:.1f} W avg, 24/7)")
+    print(f"  Duty-cycle: {up_frac * 100:.0f}% up @ {avg_active_w:.1f} W, {idle_frac * 100:.0f}% idle @ {avg_idle_w:.1f} W, {off_frac * 100:.0f}% off → est. {_fmt_cost(duty_annual_cost)}/year")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
