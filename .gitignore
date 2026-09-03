@@ -11,3 +11,6 @@ build/
 plots/
 .env
 *.png
+
+# Allow examples and documentation assets
+!examples/**
