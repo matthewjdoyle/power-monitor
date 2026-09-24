@@ -50,18 +50,24 @@ from power_monitor.collector import cmd_probe as run_probe
 
 DAILY_CSV = CSV_PATH
 
-# Seaborn deep muted palette — clean modern look (blues, greens, warm accents)
+# Semantic plot colors: green (primary) and purple (secondary)
+COLOR_PRIMARY = "#55A868"     # muted green (primary: PSYS, energy bars, rolling avg)
+COLOR_SECONDARY = "#8172B3"   # muted purple (secondary: Package, rolling avg line, avg power)
+COLOR_ACCENT = "#DA8BC3"      # muted pink (accents: today/partial)
+COLOR_CUMULATIVE = "#8C8C8C"  # grey (cumulative energy line & fill)
+
+# Seaborn deep muted palette — green and purple leading
 SEABORN_DEEP = [
-    "#4C72B0",  # muted blue (primary: PSYS)
-    "#DD8452",  # warm orange (secondary: Package, overlays)
-    "#55A868",  # muted green
-    "#C44E52",  # muted red
-    "#8172B3",  # muted purple
-    "#937860",  # muted brown
-    "#DA8BC3",  # muted pink (accents: today/partial)
-    "#8C8C8C",  # grey (energy fill)
-    "#CCB974",  # muted gold
-    "#64B5CD",  # muted cyan
+    COLOR_PRIMARY,    # muted green (primary: PSYS, energy bars)
+    COLOR_SECONDARY,  # muted purple (secondary: Package, overlays)
+    "#4C72B0",        # muted blue
+    "#DD8452",        # warm orange
+    "#C44E52",        # muted red
+    "#937860",        # muted brown
+    COLOR_ACCENT,     # muted pink (accents: today/partial)
+    COLOR_CUMULATIVE, # grey (energy fill)
+    "#CCB974",        # muted gold
+    "#64B5CD",        # muted cyan
 ]
 # Heatmap colormap — deep blues to warm gold (seaborn-style)
 HEATMAP_CMAP = "YlOrBr"  # yellow-orange-brown, perceptually uniform, readable
@@ -669,17 +675,17 @@ def cmd_graph(view="today", start_str=None, end_str=None):
         ax.set_axisbelow(True)
 
     # ── Power panel ──────────────────────────────────────────────────
-    ax_top.plot(dt, primary_ds, color=SEABORN_DEEP[0], lw=0.4, alpha=0.25, label="_nolegend_")
+    ax_top.plot(dt, primary_ds, color=COLOR_PRIMARY, lw=0.4, alpha=0.25, label="_nolegend_")
     if has_psys:
-        ax_top.plot(dt, pkg_ds, color=SEABORN_DEEP[1], lw=0.5, alpha=0.4, label="Package")
+        ax_top.plot(dt, pkg_ds, color=COLOR_SECONDARY, lw=0.5, alpha=0.4, label="Package")
 
     if roll is not None:
         ax_top.plot(
-            dt, roll, color=SEABORN_DEEP[0], lw=1.8,
+            dt, roll, color=COLOR_PRIMARY, lw=1.8,
             label=f"{primary_name} rolling avg ({roll_label_mins}min)",
         )
     else:
-        ax_top.plot(dt, primary_ds, color=SEABORN_DEEP[0], lw=1.2, label=primary_name)
+        ax_top.plot(dt, primary_ds, color=COLOR_PRIMARY, lw=1.2, label=primary_name)
 
     ax_top.set_ylabel("Power (W)")
     ax_top.legend(loc="upper right", ncol=2)
@@ -711,14 +717,14 @@ def cmd_graph(view="today", start_str=None, end_str=None):
         dt_s = np.diff(ts_ds)
         energy_j = np.cumsum(np.nan_to_num(primary_ds[:-1], nan=0) * dt_s)
         energy_wh = np.insert(energy_j / 3600, 0, 0)
-        ax_bot.fill_between(dt, energy_wh, color=SEABORN_DEEP[7], alpha=0.15)
-        ax_bot.plot(dt, energy_wh, color=SEABORN_DEEP[7], lw=1.2)
+        ax_bot.fill_between(dt, energy_wh, color=COLOR_CUMULATIVE, alpha=0.15)
+        ax_bot.plot(dt, energy_wh, color=COLOR_CUMULATIVE, lw=1.2)
         final = energy_wh[-1]
         elabel = f"{final * 1000:.1f} Wh" if final < 1 else f"{final / 1000:.2f} kWh"
         ax_bot.annotate(
             f"{elabel} ({primary_name})",
             xy=(0.03, 0.95), xycoords="axes fraction",
-            fontsize=9, ha="left", va="top", color=SEABORN_DEEP[0],
+            fontsize=9, ha="left", va="top", color=COLOR_PRIMARY,
         )
 
     ax_bot.set_ylabel("Energy (Wh)")
@@ -969,14 +975,14 @@ def cmd_graph_month():
     fig.colorbar(im, ax=ax_top, pad=0.02, label="Avg Power (W)")
 
     x = np.arange(days)
-    bars = ax_bot.bar(x, bar_energies, color=SEABORN_DEEP[0], edgecolor="none", width=0.7)
-    bars[-1].set_color(SEABORN_DEEP[6])
+    bars = ax_bot.bar(x, bar_energies, color=COLOR_PRIMARY, edgecolor="none", width=0.7)
+    bars[-1].set_color(COLOR_ACCENT)
 
     roll = _rolling_mean(np.array(bar_energies), 7)
     ax2 = ax_bot.twinx()
-    ax2.plot(x, roll, color=SEABORN_DEEP[1], lw=1.8, label="7-day rolling avg")
-    ax2.set_ylabel("Rolling Avg Energy (kWh)", color=SEABORN_DEEP[1], fontsize=9)
-    ax2.tick_params(axis="y", colors=SEABORN_DEEP[1])
+    ax2.plot(x, roll, color=COLOR_SECONDARY, lw=1.8, label="7-day rolling avg")
+    ax2.set_ylabel("Rolling Avg Energy (kWh)", color=COLOR_SECONDARY, fontsize=9)
+    ax2.tick_params(axis="y", colors=COLOR_SECONDARY)
     ax2.set_ylim(bottom=0)
 
     ax_bot.set_xticks(range(0, days, 2))
@@ -1108,7 +1114,7 @@ def cmd_graph_week():
 
     # ── Daily energy bars + average power line ───────────────────────
     x = np.arange(len(days))
-    bars = ax.bar(x, energies, color=SEABORN_DEEP[0], edgecolor="white", lw=0.5, width=0.65)
+    bars = ax.bar(x, energies, color=COLOR_PRIMARY, edgecolor="white", lw=0.5, width=0.65)
 
     y_max_data = max(energies) if energies else 0.001
     for i, (bar, e) in enumerate(zip(bars, energies)):
@@ -1126,9 +1132,9 @@ def cmd_graph_week():
                     label_text, ha="center", va="bottom", fontsize=9, fontweight="bold")
 
     ax2 = ax.twinx()
-    ax2.plot(x, avg_powers, color=SEABORN_DEEP[1], marker="o", ms=6, lw=2.0, label="Avg power (W)")
-    ax2.set_ylabel("Average Power (W)", color=SEABORN_DEEP[1])
-    ax2.tick_params(axis="y", colors=SEABORN_DEEP[1])
+    ax2.plot(x, avg_powers, color=COLOR_SECONDARY, marker="o", ms=6, lw=2.0, label="Avg power (W)")
+    ax2.set_ylabel("Average Power (W)", color=COLOR_SECONDARY)
+    ax2.tick_params(axis="y", colors=COLOR_SECONDARY)
     ax2.set_ylim(bottom=0)
     ax2.grid(False)
 
@@ -1137,20 +1143,20 @@ def cmd_graph_week():
     ax.set_ylabel("Energy (kWh)")
     ax.set_ylim(0, max(energies) * 1.20 if max(energies) > 0 else 1)
 
-    bars[-1].set_color(SEABORN_DEEP[6])
+    bars[-1].set_color(COLOR_ACCENT)
 
     legend_elements = [
-        Patch(facecolor=SEABORN_DEEP[0], label="Energy (kWh)"),
-        Patch(facecolor=SEABORN_DEEP[6], label="Today (partial)"),
-        Line2D([0], [0], color=SEABORN_DEEP[1], marker="o", lw=2.0, label="Avg power (W)"),
+        Patch(facecolor=COLOR_PRIMARY, label="Energy (kWh)"),
+        Patch(facecolor=COLOR_ACCENT, label="Today (partial)"),
+        Line2D([0], [0], color=COLOR_SECONDARY, marker="o", lw=2.0, label="Avg power (W)"),
     ]
     ax.legend(handles=legend_elements, loc="upper right", framealpha=0.9)
 
     # ── Cumulative energy panel (square) ─────────────────────────────
     cum_dates = [days[0]] + [d + timedelta(days=1) for d in days]
     cum_kwh = np.concatenate([[0.0], np.cumsum(energies)]) * 1000  # Wh
-    ax_cum.plot(cum_dates, cum_kwh, color=SEABORN_DEEP[7], lw=1.4)
-    ax_cum.fill_between(cum_dates, cum_kwh, color=SEABORN_DEEP[7], alpha=0.15)
+    ax_cum.plot(cum_dates, cum_kwh, color=COLOR_CUMULATIVE, lw=1.4)
+    ax_cum.fill_between(cum_dates, cum_kwh, color=COLOR_CUMULATIVE, alpha=0.15)
     ax_cum.set_ylabel("Energy (Wh)")
     ax_cum.set_xlabel("Time")
     ax_cum.set_xlim(cum_dates[0], cum_dates[-1])
@@ -1161,7 +1167,7 @@ def cmd_graph_week():
     ax_cum.annotate(
         f"{total_kwh:.2f} kWh",
         xy=(0.03, 0.95), xycoords="axes fraction",
-        fontsize=9, ha="left", va="top", color=SEABORN_DEEP[0],
+        fontsize=9, ha="left", va="top", color=COLOR_PRIMARY,
     )
 
     # ── Analytics table (LaTeX style) ────────────────────────────────
